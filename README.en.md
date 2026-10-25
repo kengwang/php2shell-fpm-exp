@@ -1,17 +1,18 @@
-# PHP2Shell — session UAF → pure-HTTP RCE on PHP 8.4.4 (mod_php and nginx + PHP-FPM)
+# PHP2Shell — session UAF → pure-HTTP RCE (PHP 8.4.4 mod_php, nginx + PHP-FPM, an upstream phpMyAdmin image)
 
 English | [中文](README.md)
 
-One vulnerability, two chains, two SAPIs, three heap calibrations:
+One vulnerability, three chains, two SAPIs, four heap calibrations:
 
 | chain | victim shape | how code executes | PoC |
 | --- | --- | --- | --- |
 | mod_php | Apache 2.4.58 prefork + `libphp.so`, page is a bare `echo` | dangling `zend_reference` → fake `HashTable` with `pDestructor = zif_system`, the last request calls `system()` | `exploits/def_rce.py` and 3 more |
 | nginx + PHP-FPM | nginx 1.24 + `php-fpm` compiled here (`pm = static`), page calls `session_start()`; `memory_limit` 8M and PHP's stock 128M, worker pools of 1 and of 4 | the dangling `BG(unserialize)` decoder rewrites where the session gets written, so the FPM worker **itself** writes a session file full of PHP code into the document root → arbitrary file write → request it | `exploits/fpm_rce.py`, `exploits/fpm128_rce.py` (`WORKERS=n` covers both the single worker and the pool) |
+| upstream phpMyAdmin image | `phpmyadmin/phpmyadmin:5.2.3-fpm` (PHP 8.3.26) **exactly as the vendor ships it**: its own ini (`memory_limit=512M`), its own `[www]` pool (`pm = dynamic`), the real phpMyAdmin site, and its `index.php` as the victim page | same primitive: a 100 MB session file fills the stock 512M → dangling decoder → `ps_files->basedir` rewritten → the worker writes the session into phpMyAdmin's own `tmp/` (world-writable out of the box, and front ends are told to serve it as PHP) | `exploits/pma512_rce.py` |
 
-Neither chain needs an exploit class or a helper endpoint, neither changes the
-victim's PHP code, neither needs a rebuild or gdb on the target, ASLR is fully
-enabled in both, and every byte on the wire is plain HTTP.
+All three chains need no exploit class or helper endpoint, none changes the
+victim's PHP code, none needs a rebuild or gdb on the target, ASLR is fully
+enabled in every run, and every byte on the wire is plain HTTP.
 
 **The mod_php chain's** whole attack surface is these 22 bytes:
 
@@ -34,16 +35,34 @@ dangling decoder is per-process state, so the chain arms all N children through
 nginx's strict round-robin over FPM and fires the three stages behind it — proven
 against a 4-child `pm = static` pool.
 
+**The phpMyAdmin chain** points the same primitives at somebody else's product:
+the victim is not a page we wrote but the real phpMyAdmin, and not one directive
+is lowered — `memory_limit` is the shipped 512M, `post_max_size` /
+`upload_max_filesize` the shipped 2048K, `session.use_strict_mode=On` the shipped
+value.  The heap pressure therefore cannot come from a single request any more
+(the front end only allows 2 MB): it comes from a **session file fed up to
+100,566,855 bytes**, record by record.  phpMyAdmin calls `session_start()` at
+script level, so the *unserialization of that file* is what hits the limit,
+`zend_first_try` absorbs the fatal, the worker survives and the decoder dangles.
+The write target is no longer a path we choose either: a `zend_string` is forged
+inside 880 KB of session content, and the worker writes the session into
+phpMyAdmin's own `tmp/`, which the image ships world-writable and our front end
+serves as PHP.  Because `pm = dynamic` does not pin the number of live
+children, every stage attempt gets its own crafted session.
+
 Verified targets: our own `PHP 8.4.4-dev` build (Ubuntu 24.04; mod_php via the
 prebuilt `libphp.so` md5 `f402b493b1df82cbf34021b4aef133cb`, shipped in the image
 so the calibration and the binary always agree; php-fpm compiled on demand by
-`build-phpfpm.sh`, md5 `4b6b73a350e09fcc791c0f20a95ca7d0`).
+`build-phpfpm.sh`, md5 `4b6b73a350e09fcc791c0f20a95ca7d0`), plus the upstream
+`phpmyadmin/phpmyadmin:5.2.3-fpm` image itself (PHP 8.3.26) with neither the
+image nor its ini modified.
 
 > **This is derivative work.**  The mod_php chain, its stage structure and the
 > reference implementation come from
 > [9bie/php2shell-bypass-aslr-exp](https://github.com/9bie/php2shell-bypass-aslr-exp),
-> and the direction of the FPM chain comes from the Calif Research php2shell
-> write-up — see [Acknowledgements](#acknowledgements) and
+> and the direction of the FPM chain — which the phpMyAdmin chain extends — comes
+> from the Calif Research php2shell write-up — see
+> [Acknowledgements](#acknowledgements) and
 > [What we added over the reference chain](#what-we-added-over-the-reference-chain).
 
 ## Quick start
@@ -67,15 +86,24 @@ python p2s.py exploit fpm4     # same chain, but php-fpm is a pool of 4 workers
 python p2s.py prune fpm fpm128 fpm4
                                # delete session files + the shell the chain wrote
 python p2s.py fpm-down         # optional profile names; without them all three go away
+
+python p2s.py pma-up           # third chain: run the upstream
+                               # phpmyadmin/phpmyadmin:5.2.3-fpm as shipped, plus an nginx
+                               # sidecar sharing its network stack on 127.0.0.1:8115
+python p2s.py verify pma       # the image's own ini/pool, uploadprogress unloaded, tmp/ perms
+python p2s.py exploit pma      # pure HTTP, end to end -> PROOF: uid=33(www-data)
+python p2s.py prune pma        # delete the 100 MB session file + the written tmp/x.php
+python p2s.py pma-down         # remove those two containers
 ```
 
 `build` once, then `exploit <profile>` alone is enough: it re-creates a missing
 container by itself (`ensure`), cleans stale session/proof files before and after
 the run, prints the PoC output and exits non-zero when no proof was produced.
 A 128M mod_php run takes ~8 s end to end, the FPM chain ~11.6 s, the FPM 128M
-chain ~35.5 s and the FPM 128M pool of 4 ~43 s (measured 2026-10-24).
-`exploit`/`verify`/`prune` all accept the names `fpm`, `fpm128` and `fpm4`, and
-`-c '…'` works there too.
+chain ~35.5 s, the FPM 128M pool of 4 ~43 s and phpMyAdmin at 512M ~150 s
+(measured 2026-10-24/25).
+`exploit`/`verify`/`prune` all accept the names `fpm`, `fpm128`, `fpm4` and `pma`,
+and `-c '…'` works there too.
 
 Useful knobs (env):
 
@@ -88,13 +116,15 @@ Useful knobs (env):
 | `FPM_PORT` | `8112` | host port of the 8M nginx + PHP-FPM target |
 | `FPM128_PORT` | `8113` | host port of the 128M nginx + PHP-FPM target |
 | `FPM4_PORT` | `8114` | host port of the 128M target with a 4-worker pool |
+| `PMA_PORT` | `8115` | host port of the phpMyAdmin chain (the third SAPI target) |
+| `PMA_IMAGE` | `phpmyadmin/phpmyadmin:5.2.3-fpm` | the upstream image the third chain attacks |
 | `CMD` via `exploit <p> -c '…'` | `id>/srv/out/pd` (`id` for the three fpm profiles) | command to run; for mod_php the proof path follows the `>/srv/out/<file>` redirect, for `fpm`/`fpm128`/`fpm4` the output is saved to `out-fpm/pfpm` / `out-fpm128/pfpm128` / `out-fpm4/pfpm4` |
 
 ## What the lab is
 
 ```
 p2s.py                  one-click driver (build/up/down/status/verify/offsets/exploit/prune
-                        + fpm-build/fpm-up/fpm-down)
+                        + fpm-build/fpm-up/fpm-down + pma-up/pma-down)
 docker/
   Dockerfile            ubuntu:24.04 + apache2 runtime libs + prebuilt libphp.so (mod_php)
   Dockerfile.fpm        ubuntu:24.04 + nginx + /opt/phpfpm (one image, all three FPM profiles)
@@ -117,6 +147,10 @@ docker/
   fpm4/                 the 128M target with a pool: differs from fpm128/ only in
                         `pm.max_children = 4` in php-fpm.conf; ini, nginx.conf and both
                         pages are byte-identical
+  pma/nginx.conf        the third chain's front end: plain nginx for the official
+                        phpMyAdmin container, root /var/www/html, .php → the
+                        container's 127.0.0.1:9000, and `client_max_body_size 2m`
+                        is exactly what the image's own UPLOAD_LIMIT=2048K asks for
   entrypoint.sh         mkdir /srv/out, then `apache2 -f /srv/profile/apache.conf`
   entrypoint-fpm.sh     start php-fpm, then `exec nginx -g 'daemon off;'`
 env/gen_profiles.py     single source of truth for the 14 profiles -> env/generated/<name>/
@@ -132,6 +166,9 @@ exploits/               the PoCs (self-contained, no absolute host paths)
   fpm128_rce.py         the same chain against PHP's stock memory_limit=128M
                         (empty-filename RFC1867 parts as the pressure source);
                         WORKERS=n arms a pool, so it also covers the 4-worker target
+  pma512_rce.py         the third chain: the upstream phpMyAdmin 5.2.3-fpm image at
+                        its stock 512M — grow a 100 MB session file first, then let
+                        the script-level session_start() hit the limit on it
 measure/                calibration & gdb helpers (not needed for a plain run)
   exploit drivers       measure_dd_any.py, mw_full_test.py, measure_s3_formfill.py,
                         measure_loaded_worker.py, dev_r0.py (re-measure R0)
@@ -157,6 +194,17 @@ They are not part of the 14 mod_php profiles: `fpm-up`/`fpm-down` manage them
 (optionally with profile names), and `status` adds a row for each one while it is
 alive.
 
+The phpMyAdmin chain is two containers.  `p2s-pma` *is* the official
+`phpmyadmin/phpmyadmin:5.2.3-fpm` — its site, its `php.ini`, its `[www]` pool and
+its `/sessions` are all the image's own, and we bind-mount no configuration into
+it.  `p2s-pma-web` is an nginx sidecar on the same network stack
+(`--network container:p2s-pma`) that mounts `docker/pma/nginx.conf` read-only and
+forwards the host `PMA_PORT` (8115 by default) to the container's
+`127.0.0.1:9000`.  It is not part of `up`/`down`/`status` either; `pma-up` and
+`pma-down` manage it.  The only change to how the image is started is
+`rm -f /usr/local/etc/php/conf.d/docker-php-ext-uploadprogress.ini` — see the
+image-specific gotcha under [Victim requirements](#victim-requirements).
+
 ## Profiles and which PoC fits
 
 | alias | container | port | memory_limit | display_errors | expose_php | save_path | workers | opcache | PoC |
@@ -178,18 +226,22 @@ alive.
 | `fpm` | p2s-fpm | 8112 | 8M | Off | On | /var/lib/php/sessions | 1 (static) | – | `exploits/fpm_rce.py` |
 | `fpm128` | p2s-fpm128 | 8113 | 128M | Off | On | /var/lib/php/sessions | 1 (static) | – | `exploits/fpm128_rce.py` |
 | `fpm4` | p2s-fpm4 | 8114 | 128M | Off | On | /var/lib/php/sessions | 4 (static) | – | `exploits/fpm128_rce.py` + `WORKERS=4` |
+| `pma` | p2s-pma + p2s-pma-web | 8115 | 512M | On | On | /sessions | 2 (dynamic, max 5) | On | `exploits/pma512_rce.py` |
 
-The first 14 rows are mod_php profiles; the last three are the nginx + PHP-FPM chain
-(`sapi=fpm`), the same chain at two `memory_limit`s and two pool sizes, managed by
-`fpm-build`/`fpm-up` on its own.
+The first 14 rows are mod_php profiles; `fpm`/`fpm128`/`fpm4` are the nginx +
+PHP-FPM chain (`sapi=fpm`), the same chain at two `memory_limit`s and two pool
+sizes, managed by `fpm-build`/`fpm-up` on its own; `pma` is the third chain — PHP
+8.3.26, victim is somebody else's image and site, managed by `pma-up` alone, and
+the ini columns are the vendor's stock state (the image has no `php.ini`, so
+those values are PHP's compiled defaults plus `phpmyadmin-misc.ini`).
 
 The mod_php profiles all serve the same 22-byte victim page.  `exploit <alias>`
 picks the PoC, the heap calibration (`PROFILE`) and the proof path for you;
 `-s <script>` overrides the script, `-c` the command, a trailing number sets the
 fan-out width for `mw` (default: the profile's `MaxRequestWorkers`).
-`exploit fpm`/`fpm128`/`fpm4` take `-c` as well and save their proofs to
-`out-fpm/pfpm` / `out-fpm128/pfpm128` / `out-fpm4/pfpm4`; the `fpm4` row also sets
-`WORKERS=4` for the PoC.
+`exploit fpm`/`fpm128`/`fpm4`/`pma` take `-c` as well and save their proofs to
+`out-fpm/pfpm` / `out-fpm128/pfpm128` / `out-fpm4/pfpm4` / `out-pma/ppma`; the
+`fpm4` row also sets `WORKERS=4` for the PoC.
 
 Verified in this tree on 2026-10-23: `p2s.py verify` is green for all 14 mod_php
 containers, and one back-to-back sweep of `exploit` produced
@@ -205,6 +257,14 @@ each in ~33.8 s.  Re-measured on 2026-10-24 after folding the pool orchestration
 that PoC (`WORKERS=1`): still green, ~35.5 s.  `exploit fpm4` worked on its first run
 against a 4-child `pm = static` pool — one arming round covers R2a, R2b and R3 — and
 reproduced after `fpm-down fpm4` + `fpm-up fpm4`, each in ~43 s.
+For the phpMyAdmin chain, `phpmyadmin/phpmyadmin:5.2.3-fpm` runs as shipped (image
+and ini untouched apart from deleting `docker-php-ext-uploadprogress.ini`), and
+`exploit pma` produced `uid=33(www-data)` on five independent runs, including after
+`pma-down` + `pma-up` recreated both containers.  Every run's client-side size for
+A matched `stat` byte for byte (`match=True`), `prime -> 200`, the **second** stage
+attempt returned `502` and wrote the shell, and `GET /tmp/x.php?0=id` echoed; ~154 s
+per run, of which R0 (208 records) is ~147 s (measured 2026-10-24/25).
+`verify pma` is green.
 
 ## What we added over the reference chain
 
@@ -230,6 +290,10 @@ baseline; the table below is what this tree changes, with the profile that prove
 | one SAPI only (mod_php) | a second chain through PHP-FPM, which is a completely different SAPI path: the pre-RINIT dangling `BG(unserialize)` decoder rewrites the session write target, so no code pointer and no `libphp` leak are needed at all | `fpm`, `fpm128`, The chain (2) below |
 | the FPM chain needs a small `memory_limit` to be fillable at all | the pressure source becomes `filename=""` RFC1867 parts: ~300 request bytes per ~128 KB of heap, 920 parts are enough to OOM a worker under PHP's stock 128 MB limit; and every request also fits nginx's default `client_max_body_size 1m`, so the front end needs no tuning | `fpm128`, the 128M variant below |
 | the FPM chain's stale decoder is **per-process**, so the pool had to be pinned to `pm = static` with one child | nginx opens one upstream connection per request and FPM hands consecutive connections to its idle children in a strict round-robin: send N primes back to back and the whole pool is armed, then the stages follow and each finds a distinct armed child.  R2a and R2b kill their child, so one arming round covers `min(3, N)` stages | `fpm4` (4 static children, all three stages from one round), the multi-worker variant below |
+| the victim is a 22- or 39-byte page *we* wrote, under limits *we* set in `php.ini` | the third chain runs against **somebody else's product image**: `phpmyadmin/phpmyadmin:5.2.3-fpm` completely unmodified (PHP 8.3.26), its real `index.php` as the attack surface, and `memory_limit` / `post_max_size` / `max_input_vars` / `use_strict_mode` / the pool all at vendor defaults — not one directive lowered | `pma`, The chain (3) below |
+| the 128M variant fills the heap with 920 parts inside one request, which presumes the front end gives enough body room | with a stock 2048K cap a single request cannot reach 512M, so the pressure moves into a **session file accumulated across requests**: 208 upload-progress records grown to 100,566,855 bytes, and phpMyAdmin's own script-level `session_start()` is what breaks the limit while unserializing it — every request stays under 2 MB | `pma`'s R0/R3 |
+| the write path is chosen by the PoC, and so is the file content | the path is forged out of the **victim's own session content**: phpMyAdmin stores the 880 KB `guid` from its login flow as a session key, and at a known offset inside it we build a `zend_string` (length + bytes) so that `ps_files->basedir` points at phpMyAdmin's own `tmp/`, which the image ships `drwxrwxrwt` | `pma`'s R1/R4 |
+| a pinned pool size means `WORKERS` can be stated exactly | under `pm = dynamic` the live child count is not controllable, yet the stale decoder is still per-process: the chain mints one crafted session per stage attempt and fires the same stage body at each sid — the attempt that lands on the armed child writes the shell, the others just save their own session normally | `pma` (`ATTEMPTS=6`) |
 
 ## The chain (1) — mod_php
 
@@ -408,6 +472,94 @@ the heap calibration changes — only the orchestration does.
   The status code tracks flushing, as the gotcha below says, so success stays
   "the written shell echoes something" rather than a code.
 
+## The chain (3) — upstream phpMyAdmin 5.2.3-fpm (stock 512M)
+
+`exploits/pma512_rce.py`.  The victim is the official
+`phpmyadmin/phpmyadmin:5.2.3-fpm` (PHP 8.3.26) started exactly as published: the
+site is real phpMyAdmin, the attack surface is its `/index.php`, and
+`memory_limit=512M`, `post_max_size=upload_max_filesize=2048K`,
+`max_input_vars=10000`, `session.use_strict_mode=On` and the `[www]` pool
+(`pm = dynamic`, `start_servers = 2`, `max_children = 5`) are all the image's own
+values — nothing is lowered.  The front end's `client_max_body_size 2m` is the
+room the image itself asks for through `UPLOAD_LIMIT=2048K`.  The write target
+`/var/www/html/tmp` is phpMyAdmin's own maintained temp directory, shipped
+`drwxrwxrwt`; whether it can be executed depends on the front end — our sidecar,
+like the calibration environment, hands the whole site root to PHP through one
+`location ~ \.php$`, so the path is reachable.  That is a property of the front
+end, not of the image, and it is listed under Victim requirements for that reason.
+The mechanism is the same as chain (2) (a pre-RINIT upload-progress decode leaves
+`BG(unserialize)` dangling); only three things are new.
+
+**The pressure source becomes the session file.**  A 2 MB body cap rules out
+filling 512M in one request, so the heap is filled by a session file grown
+record by record to **100,566,855 bytes** (R0).  Each record is an ordinary
+upload-progress request: `PHP_SESSION_UPLOAD_PROGRESS=<key>` plus a file part; at
+that part's `FILE_START` the session is decoded and flushed — which persists the
+record — and immediately afterwards a wall of nested `filename=""` parts
+(`x<k>[a][a]…`, depth 60) OOMs the body parser, so `cleanup` never runs, the
+record stays, and the worker is respawned.  The wall size is computed client-side
+as `512M − 2 × tracked file length`, each record's length follows from the
+serialized layout of `upload_progress_<key>|a:5:{…}` plus the digit counts, and
+the read position is simulated from the 5 KiB multipart buffer, so the final byte
+count is reached without asking the server for any feedback (a `stat` check agreed
+on every run, `match=True`).  208 records in total: 1 seed + 73 short-filename
+records (316 B) + 134 records with a 750 KB filename, the last one's filename
+length solved so the sum lands exactly on the target.  The seed request
+deliberately presents an id whose file does not exist (`PHPSESSID=seed0`):
+`use_strict_mode` throws it away and hands back one PHP allocated itself, so A
+contains nothing but upload-progress records — no phpMyAdmin-owned fields in
+front of them, which is what makes both the byte-for-byte sizing and the heap
+layout the stage aims at reproducible.
+
+**Arming happens inside somebody else's `session_start()`** (R3).  phpMyAdmin
+calls it at script level (`libraries/classes/Session.php`), not pre-RINIT, so the
+chain first fills the heap with 8150 nested field names (2,003,799 bytes, right at
+the 2048K limit) and then lets the script-level decode read the 100 MB file:
+measured `wall ≈ 423,624,704 B` + `A decode ≈ 243,175,424 B` breaks
+536,870,912 inside `php_var_unserialize()`, `zend_first_try` in
+`php_execute_script()` absorbs the fatal — the worker survives with
+`BG(unserialize)` still at level 1, pointing at the freed `php_unserialize_data`.
+**The prime has to answer 200 for the worker to be armed** (it must not die), and
+arm only works on a cold opcache, so R2 reloads the pool (`kill -USR2 1`) first
+and makes the prime the new child's first phpMyAdmin request.
+
+**The session content is the carrier, and the target path is forged** (R1 + R4).
+The stage does not use a file we wrote: it is produced through phpMyAdmin's own
+login flow — GET `/index.php` for the CSRF token, then a multipart login POST
+carrying an **880,000-byte `guid`**, which phpMyAdmin stores as a `$_SESSION` key,
+so the resulting file is a buffer whose byte at every offset we know.  The guid
+starts at file offset 125, and four things are overwritten inside it:
+`DT_OFF=528360` → 8 zero bytes (`var_dtor_entries.used_slots = 0`), `+0x50` → 24
+(the fake `zend_string`'s `len` = `len("/var/www/html/tmp/x.php")+1`), `+0x58` →
+the path with its terminating NUL, `E_OFF=856040` → `AIM_U=-108596`
+(`var_entries.used_slots`).  The stage body is 1,060,409 bytes: 4172 nested field
+names shape chunk K to the calibrated pages, 300 fields with 15-byte values
+(`zend_string_alloc(15)` = 40 B → allocator bin 4) prewarm it, and 6 re-sent names
+free six bin-4 slots for the progress array's own key strings, which is what parks
+`ps_files` at its measured offset (`K+0x82e88`).  Then
+`PHP_SESSION_UPLOAD_PROGRESS=<?php system($_GET[0]); ?>` plus a file part triggers
+the pre-RINIT decode — of that 880 KB session.  `s_read` allocates the whole file
+as one buffer at `K+0x86018` (page 134), which carries the forged bytes over `DT`
+(p263) and `E` (p343) while `D_A` (p435) stays outside; with `used_slots` rewritten
+by the guid, the five pushes land on `ps_files` at `−24/−16/−8/+0/+8`, so `basedir`
+becomes the fake `zend_string` forged at `DT+0x40`.  `php_session_flush()` then
+takes `ps_files_open()`'s reopen path, builds the path from the fake basedir,
+`open()` stops at the embedded NUL, and the session text — payload record
+included — is `pwrite`n to `/var/www/html/tmp/x.php` (880,503 bytes).  The attempt
+that hits the armed worker answers **502** (the child dies after writing); the
+others answer 200, since unarmed children just save their own session.
+
+**The pool is not pinned, so each attempt gets its own session** (R4).
+`BG(unserialize)` is per-process and `pm = dynamic` does not fix the number of
+live children, while phpMyAdmin owns the id rotation — so the chain mints
+`ATTEMPTS=6` crafted sessions up front and fires the same stage body once per sid.
+The one that reaches the armed child writes the shell; the rest are harmless.
+`GET /tmp/x.php?0=id` returns `uid=33(www-data)`.
+
+Measured 5/5: green on a fresh container and again after `pma-down`/`pma-up`
+recreated both containers.  ~154 s end to end, ~147 s of it in R0 (208 records,
+each of which has to wait for FPM to hand back a live child).
+
 ## Constants
 
 | item | value |
@@ -453,6 +605,32 @@ the heap calibration changes — only the orchestration does.
 | `WORKERS` | 1 (`fpm128`) / 4 (`fpm4`) | live children that must be armed; `fpm4` uses `pm = static` + `pm.max_children = 4` in `docker/fpm4/php-fpm.conf` |
 | `ATTEMPTS` | 1 single worker / 3 pool | whole-chain retries, each on fresh session ids (a stage that misses wipes the record) |
 | `SETTLE` | 0.5 s | pause before an arming round so the killed children are back |
+
+### Constants (phpMyAdmin 5.2.3-fpm, 512M)
+
+| item | value | note |
+| --- | --- | --- |
+| `TARGET` | `100,566,855` B | length of session file A, assembled from 208 upload-progress records (1 seed + `NSMALL=73` at 316 B + 134 with a 750 KB filename, the last filename length solved to close the sum exactly) |
+| `PRIME_N` | `8150` | nested field names; prime body 2,003,799 B, inside the stock `post_max_size=2048K` |
+| what breaks the limit | wall `423,624,704` + decode `243,175,424` B | reported as `tried to allocate 753664 bytes`, raised inside `/var/www/html/libraries/classes/Session.php` |
+| `NFF` / `NPW` / `NDUP` | `4172` / `300` / `6` | stage body 1,060,409 B: shaping fields / bin-4 prewarm / six freed bin-4 slots |
+| `GLEN` / guid start | `880,000` / file offset `125` | the carrier is the `browser_access_time` key phpMyAdmin stores on login |
+| `DT_OFF` / `E_OFF` | `528360` / `856040` | i.e. `DT − buffer` and `E − buffer`, so they are offsets inside the guid |
+| `AIM_U` | `-108596` | `(ps_files − E − 40) / 8`, so that the 5th push lands on `basedir` |
+| `ps_files` | `chunk + 0x82e88` | measured here; the published run had `+0x82cd0`, `0x1b8` = 440 B = 55 slots earlier |
+| `s_read` buffer | `chunk + 0x86018` (page 134) | covers `DT` (p263) and `E` (p343); `D_A` (p435) stays outside |
+| fake `zend_string` | `DT + 0x40`, `len` at `DT_OFF+0x50` = 24, bytes at `+0x58` | the length counts the trailing NUL, and `open()` stops at it |
+| written file | `/var/www/html/tmp/x.php`, 880,503 B | the directory is shipped `drwxrwxrwt`; being executable is a property of the front end (ours serves `tmp/` to PHP) |
+| ini / pool | all stock: `512M`, `2048K`, `max_input_vars=10000`, `use_strict_mode=On`, `pm = dynamic` / `start_servers = 2` / `max_children = 5` | the only start-up change is unloading the `uploadprogress` extension — see Victim requirements |
+| `ATTEMPTS` / `SETTLE` | `6` / `0.35 s` | one crafted session per stage attempt; a pause after each A record so FPM returns a live child |
+
+As on the self-built FPM targets, none of these is a leak: the layout inside a
+chunk is byte-identical after `fork()`, so a container restart with a fresh ASLR
+set changes nothing (verified).  Every one of them can be overridden by an
+environment variable of the same name (`TARGET`, `PRIME_N`, `NFF`/`NPW`/`NDUP`,
+`GLEN`, `DT_OFF`/`E_OFF`/`AIM_U`, `NSMALL`/`FNLEN`/`PER_PART`/`BODY_MAX`,
+`ATTEMPTS`/`SETTLE`, `LIMIT`); after changing image tag or ini, re-measure
+`ps_files` with the gdb twin described under "Gotchas that cost time".
 
 Everything the PoC needs from the target is a leaked `chunk` and `libphp` base per
 run, so ASLR and container restarts are irrelevant.  What is *not* portable is the
@@ -521,6 +699,34 @@ connections; `session.upload_progress.freq`/
 to 8m, the 128M variant does not) change how many shaping requests the chain needs and
 how they look.
 
+**phpMyAdmin chain.**  The hard conditions are the same as the FPM chain above (body
+parsed pre-RINIT, `upload_progress` On + cleanup On, the `files` handler, a
+web-reachable directory writable by `www-data`), plus two specific to this image:
+
+* **the PECL `uploadprogress` extension must not be loaded.**  The image ships it, and it
+  installs its own multipart upload hook over PHP's `php_rfc1867_callback` without ever
+  chaining the session module's handler — so `session.upload_progress` never initializes
+  or flushes a session during an upload at all, and the very first A record disappears.
+  `p2s.py pma-up` therefore starts the container with
+  `rm -f /usr/local/etc/php/conf.d/docker-php-ext-uploadprogress.ini`; that is the
+  **only** modification to how the image runs (`verify pma` reports
+  `upext=unloaded`).
+* **`tmp/` (or any writable directory the front end hands to PHP) must be
+  web-reachable.**  Nothing has to change about the directory: phpMyAdmin ships
+  `/var/www/html/tmp` as `drwxrwxrwt`.  Whether it is *executable* is a property of
+  the front end — our sidecar, like the calibration environment, routes the whole
+  site root through one `location ~ \.php$`, which is what makes the path work.  A
+  production front end hardened against `tmp/` execution does not, so treat this as
+  the same condition the FPM chain states (writable **and** served).
+* Deployment side, same prerequisite as the self-built targets: opcache must still be
+  cold before the prime (here: `kill -USR2 1` on the FPM master; in the field, whatever
+  makes the next request a fresh child's first), and the front end must not cap the body
+  below the image's own `UPLOAD_LIMIT=2048K`.
+* Not a condition any more: any lowered ini (`512M`, `2048K`, `max_input_vars=10000` and
+  `use_strict_mode=On` are all the vendor's values), a victim page of our own, a pinned
+  `pm = static` pool, `display_errors` / `expose_php` (both are the compiled defaults
+  here), a code pointer or a base leak, ASLR.
+
 ## Recycling
 
 * `p2s.py prune [profile…]` deletes `/tmp/sess_*` and `/srv/out/*` inside each
@@ -543,6 +749,15 @@ how they look.
   `fpm-down [profile…]` removes the containers, `docker rmi p2s-php844-fpm` the image.
   Killing the worker during prime is expected here too; FPM replaces it immediately and
   both the stale globals and the chunk layout survive.
+* phpMyAdmin chain: `p2s.py prune pma` deletes the container's `/sessions/sess_*`
+  (A alone is 100 MB) plus the `/var/www/html/tmp/x.php` the chain wrote, and the
+  host-side `out-pma/`.  `pma-down` removes `p2s-pma` and `p2s-pma-web`,
+  `docker rmi phpmyadmin/phpmyadmin:5.2.3-fpm` removes the image (~400 MB).
+  `exploit pma` runs the same cleanup before and after — a leftover A makes the next
+  prime OOM early, a leftover `x.php` makes a failure look like a success.  Records
+  and prime killing the worker are expected: the `[www]` pool respawns immediately,
+  and `docker exec p2s-pma sh -c "kill -USR2 1"` only restores the cold-opcache state
+  the heap constants were calibrated in.
 
 ## Rebuilding the victim binary
 
@@ -647,6 +862,16 @@ originally measured on a differently compiled `php-fpm` (same configure command,
 different md5), and they worked first run on this `fpm-build` output too: the block
 positions follow the configure command and the ini, not the build directory.
 
+### The phpMyAdmin victim
+
+The third chain **compiles nothing**: `pma-up` just `docker run`s the official
+`phpmyadmin/phpmyadmin:5.2.3-fpm` — PHP 8.3.26, phpMyAdmin 5.2.3, site, ini, pool and
+`/sessions` all as the vendor published them.  There is therefore also no question of
+whether a calibration survives a rebuild: it follows the image *tag*.  Changing the tag
+(or the image's `MEMORY_LIMIT` / `UPLOAD_LIMIT` env) means re-measuring `ps_files`, per
+the gdb-twin recipe under "Gotchas that cost time".  The only argument the lab adds to
+how the container starts is the removal of `docker-php-ext-uploadprogress.ini`.
+
 ## Gotchas that cost time
 
 * `docker/www/index.php` must stay byte-identical to the calibrated page
@@ -702,6 +927,45 @@ positions follow the configure command and the ini, not the build directory.
   removes it.
 * In Git Bash `SHELL` already has a meaning, so it is a bad variable name for a PoC —
   the FPM write target is `FPM_SHELL`.
+* The phpMyAdmin image ships PECL `uploadprogress`, which overrides PHP's
+  `php_rfc1867_callback` and never chains the session module's handler.  The symptom is
+  that not one A record survives while HTTP looks perfectly fine (200, `Set-Cookie`
+  present).  Every byte of pressure in this chain comes from upload-progress flushing,
+  so `pma_create()` deletes that ini first, and `verify pma`'s `upext=unloaded` is the
+  check that it worked.
+* Do not judge arming by "is A still there": the prime writes phpMyAdmin's own session
+  back over the same file.  What does show it is the prime answering **200** (it must
+  survive) together with the fatal inside its body — `Allowed memory size of
+  536870912 bytes exhausted (tried to allocate 753664 bytes) in
+  …/libraries/classes/Session.php` — raised *within* `session_start()`; and,
+  conversely, the stage that hits the armed child answers **502**, because that child
+  dies only after the write.  The image leaves `display_errors` at its compiled default
+  `On`, so that text is readable straight from the response.
+  `memory_get_peak_usage()` is cumulative per process and is not a per-request signal.
+* `AIM_U` is the one constant on this image that does **not** transfer from the
+  published run: `ps_files` lands at `chunk + 0x82e88` instead of `+0x82cd0`, i.e.
+  `0x1b8` = 440 B = 55 slots further along, so the aim has to be `-108596` rather than
+  `-108651` (`AIM_U = (ps_files − E − 40) / 8`).  The symptom is unmistakable: every
+  stage answers 200 with a normal page, because the session simply saves into its own
+  file.  To re-measure it, start a **twin** container (`--cap-add=SYS_PTRACE`, apt from
+  the USTC mirror, gdb 16.3) and break on `php_var_unserialize_init` — it only stops
+  when `level == 1`, so it catches exactly the stage decode.  Read `basic_globals` from
+  `.dynsym` (`bg = &basic_globals + 0x358`, `level` at `bg+8`) and `ps_globals`
+  (`mod = u64(ps_globals + 0x60)`), find the `s_read` buffer by searching the heap for
+  `browser_access_time|a:1:{s:880000:"`, and `DT_OFF`, `E_OFF` and `AIM_U` fall out in
+  one pass.  Never put breakpoints into the container the exploit runs against, and
+  leave another lab's containers alone.
+* The prime body, 2,003,799 bytes, sits just under the stock `post_max_size=2048K`
+  (2,097,152), and the front end's `client_max_body_size 2m` is exactly the room the
+  image's own `UPLOAD_LIMIT=2048K` asks for: raising `PRIME_N`, or A-big's `FNLEN`,
+  silently turns into a 413 instead of "more heap".
+* This target has **two** names for the session id: the pre-RINIT decode reads the ini
+  default `PHPSESSID`, while phpMyAdmin calls `session_name("phpMyAdmin")` at script
+  level, and which one is live depends on whether that child is serving its very first
+  request — which HTTP cannot control.  So every request the parser has to see carries
+  both names with the same value.
+* `docker logs --since` needs a UTC timestamp **with the `Z`**, or FPM's
+  `exit … (signal 6)` lines are filtered out and it looks as if no worker died.
 
 ## What was dropped from the original lab directory
 
@@ -716,14 +980,16 @@ chain was first measured with (the direct-to-9000 `fcgi.py`, `bg_fpm.py` and the
 `gdb-bg*.py` set — their conclusions are baked into `exploits/fpm_rce.py` as
 constants, and its containerised HTTP environment was rewritten as
 `docker/Dockerfile.fpm` + `docker/fpm/`), and every `out-*` run artifact.
-Kept: the six PoC scripts (four mod_php + the two nginx/PHP-FPM calibrations, the
-second of which covers both a single worker and a pool via `WORKERS`) plus the
+Kept: the seven PoC scripts (four mod_php + the two nginx/PHP-FPM calibrations, the
+second of which covers both a single worker and a pool via `WORKERS`, + the one that
+attacks the upstream phpMyAdmin image) plus the
 vendored reference `exploit.py`, the gdb-driven measurement scripts that document *how*
 each constant was obtained, and the four `gdb-*.py` scripts those drivers load.
 
-Both chains ship in this repository and both are one command away: mod_php under
+All three chains ship in this repository and each is one command away: mod_php under
 "The chain (1)" (`exploit off` and friends), nginx + PHP-FPM under "The chain (2)"
-(`exploit fpm` / `exploit fpm128` / `exploit fpm4`).
+(`exploit fpm` / `exploit fpm128` / `exploit fpm4`), the upstream product image under
+"The chain (3)" (`exploit pma`).
 
 ## Acknowledgements
 
@@ -744,7 +1010,13 @@ Both chains ship in this repository and both are one command away: mod_php under
   nginx + PHP-FPM exploit — the three-step push calibration, the choice of write
   target, scaling the pressure with empty-filename parts so PHP's stock 128M limit is
   fillable, arming a whole worker pool through the round-robin, the container and rebuild
-  flow — is this tree's work.
+  flow — is this tree's work.  Carrying it into a third shape — the untouched upstream
+  product image `phpmyadmin/phpmyadmin:5.2.3-fpm` (stock 512M / 2048K /
+  `use_strict_mode=On` / dynamic pool, a 100 MB session file accumulated across requests,
+  the write path forged out of the victim's own 880 KB of session content) — builds on
+  the same calibration direction; what this tree added there is folding it into the
+  one-click lab, the single-file PoC, and re-measuring the `ps_files` / `AIM_U` this
+  image actually uses on a twin container of our own.
 * The PHP bug itself (the session UAF behind the bailout) is upstream's; this lab
   is research into its exploitability, run against our own containers.
 

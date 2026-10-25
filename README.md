@@ -1,15 +1,16 @@
-# PHP2Shell — session UAF → 纯 HTTP RCE(PHP 8.4.4 mod_php 与 nginx + PHP-FPM)
+# PHP2Shell — session UAF → 纯 HTTP RCE(PHP 8.4.4 mod_php、nginx + PHP-FPM、上游 phpMyAdmin 镜像)
 
 [English](README.en.md) | 中文
 
-同一个漏洞,两条链、两种 SAPI、三套堆标定:
+同一个漏洞,三条链、两种 SAPI、四套堆标定:
 
 | 链 | 受害者形态 | 代码执行落地方式 | PoC |
 | --- | --- | --- | --- |
 | mod_php | Apache 2.4.58 prefork + `libphp.so`,页面只有裸 `echo` | 悬空 `zend_reference` → 伪 `HashTable` 的 `pDestructor = zif_system`,最后一个请求直接 `system()` | `exploits/def_rce.py` 等 4 个 |
 | nginx + PHP-FPM | nginx 1.24 + 自编译 `php-fpm`(`pm = static`),页面 `session_start()`;`memory_limit` 用 8M 和 PHP 出厂默认 128M 两档,worker 池 1 个和 4 个两种 | 悬空 `BG(unserialize)` 解码器改写 session 落盘目标,FPM worker **自己**把含 PHP 代码的 session 文件写进站点根目录 → 任意文件写入 → 请求该文件执行 | `exploits/fpm_rce.py`、`exploits/fpm128_rce.py`(`WORKERS=n` 同时覆盖单 worker 与多 worker) |
+| 上游 phpMyAdmin 镜像 | `phpmyadmin/phpmyadmin:5.2.3-fpm`(PHP 8.3.26)**原封不动的官方镜像**:自带 `php.ini`(`memory_limit=512M`)、自带 `[www]` 池(`pm = dynamic`),站点就是真的 phpMyAdmin,受害者页面就是它的 `index.php` | 同上:用 100 MB 的 session 文件打满出厂的 512M → 悬空解码器 → 改写 `ps_files->basedir` → worker 自己把 session 写进 phpMyAdmin 自己维护的那个 `tmp/`(出厂 `drwxrwxrwt`,前置把它当 PHP 服务) | `exploits/pma512_rce.py` |
 
-两条链都不需要攻击类/helper 接口,不改目标 PHP 代码,不要求目标重编译,目标上不需要
+三条链都不需要攻击类/helper 接口,不改目标 PHP 代码,不要求目标重编译,目标上不需要
 gdb,ASLR 全程开启,流量全是普通 HTTP。
 
 **mod_php 链**的攻击面只有这 22 个字节:
@@ -29,10 +30,21 @@ gdb,ASLR 全程开启,流量全是普通 HTTP。
 状态,所以按 nginx→FPM 的严格轮询把 N 个子进程逐个 arm,三个阶段就能打在一个
 4 进程池上。
 
+**phpMyAdmin 链**把同一套原语打在别人维护的产品上:目标不是我们写的页面,而是真的
+phpMyAdmin;限制一条都不调 —— `memory_limit` 是出厂的 512M,`post_max_size` /
+`upload_max_filesize` 是出厂的 2048K,`session.use_strict_mode=On` 也是出厂值。堆压力
+因此不再来自单个请求(2 MB 的 body 上限拦住了),而来自一个**被逐条喂到 100,566,855
+字节的 session 文件**:phpMyAdmin 在脚本里 `session_start()`,反序列化这个文件时才撞
+限制,`zend_first_try` 接住 fatal,worker 活着、解码器悬空。落点也不再是我们指定的
+路径,而是从 880 KB 的 session 内容里伪造一个 `zend_string`,让 worker 把 session 写进
+phpMyAdmin 自己的 `tmp/`。`pm = dynamic` 的池不固定存活子进程数,所以每个 stage 尝试
+配一个自己的 session。
+
 已验证目标:我们自己的 `PHP 8.4.4-dev` 构建(Ubuntu 24.04;mod_php 用
 `libphp.so` md5 `f402b493b1df82cbf34021b4aef133cb`,镜像内直接附带,保证标定值和被
 攻击的二进制永远一致;php-fpm 用 `build-phpfpm.sh` 现场编译,md5
-`4b6b73a350e09fcc791c0f20a95ca7d0`)。
+`4b6b73a350e09fcc791c0f20a95ca7d0`),以及上游
+`phpmyadmin/phpmyadmin:5.2.3-fpm` 镜像本身(PHP 8.3.26,镜像与 ini 都不改)。
 
 > **本项目是衍生工作。** mod_php 的利用链、阶段结构与参考实现来自
 > [9bie/php2shell-bypass-aslr-exp](https://github.com/9bie/php2shell-bypass-aslr-exp),
@@ -60,13 +72,21 @@ python p2s.py exploit fpm4     # 同一条链,但 php-fpm 是 4 个子进程的�
 python p2s.py prune fpm fpm128 fpm4
                                # 删 session 文件 + 链写出的 shell.php
 python p2s.py fpm-down         # 可带 profile 名,不带就三个都删
+
+python p2s.py pma-up           # 第三条链:原样跑上游 phpmyadmin/phpmyadmin:5.2.3-fpm
+                               # + 一个 nginx sidecar(共享网络栈),宿主 127.0.0.1:8115
+python p2s.py verify pma       # 镜像自带的 ini/池配置、uploadprogress 是否已卸载、tmp/ 权限
+python p2s.py exploit pma      # 纯 HTTP 打通 -> PROOF: uid=33(www-data)
+python p2s.py prune pma        # 删 100 MB 的 session 文件 + 写出的 tmp/x.php
+python p2s.py pma-down         # 删这两个容器
 ```
 
 `build` 一次之后,只用 `exploit <profile>` 就够:它会自动重建丢失的容器
 (`ensure`)、运行前后清理过期的 session/proof 文件、打印 PoC 输出,拿不到 proof 时
 返回非 0。mod_php 的 128M profile 一次利用端到端约 8 秒,FPM 链 8M 约 11.6 秒、
-FPM 128M 约 35.5 秒、FPM 128M + 4 worker 约 43 秒(2026-10-24 实测)。
-`exploit`/`verify`/`prune` 都接受 `fpm`、`fpm128`、`fpm4` 这三个名字,其余参数
+FPM 128M 约 35.5 秒、FPM 128M + 4 worker 约 43 秒、phpMyAdmin 512M 约 150 秒
+(2026-10-24/25 实测)。
+`exploit`/`verify`/`prune` 都接受 `fpm`、`fpm128`、`fpm4`、`pma` 这四个名字,其余参数
 (`-c '…'`)同样有效。
 
 环境变量:
@@ -80,6 +100,8 @@ FPM 128M 约 35.5 秒、FPM 128M + 4 worker 约 43 秒(2026-10-24 实测)。
 | `FPM_PORT` | `8112` | FPM 链 8M 目标的宿主端口 |
 | `FPM128_PORT` | `8113` | FPM 链 128M 目标的宿主端口 |
 | `FPM4_PORT` | `8114` | FPM 链 128M + 4 worker 池目标的宿主端口 |
+| `PMA_PORT` | `8115` | phpMyAdmin 链(第三个 SAPI 目标)的宿主端口 |
+| `PMA_IMAGE` | `phpmyadmin/phpmyadmin:5.2.3-fpm` | 第三条链受害者用的上游镜像 |
 | `exploit <p> -c '…'` | `id>/srv/out/pd`(三个 fpm 为 `id`) | 执行的命令;proof 路径跟随 `>/srv/out/<file>` 重定向 |
 
 ## 实验环境结构
@@ -107,6 +129,9 @@ docker/
                         和 nginx.conf(不提高 body 上限),www/ 两个页面相同
   fpm4/                 128M 目标的多 worker 版:与 fpm128/ 只差 php-fpm.conf 里的
                         `pm.max_children = 4`,ini、nginx.conf、www/ 逐字节相同
+  pma/nginx.conf        第三条链的前置:只给官方 phpMyAdmin 容器当 nginx 用,
+                        root /var/www/html,.php 走容器内 127.0.0.1:9000,
+                        `client_max_body_size 2m` 正是镜像 `UPLOAD_LIMIT=2048K` 要求的
   entrypoint.sh         mkdir /srv/out,然后 `apache2 -f /srv/profile/apache.conf`
   entrypoint-fpm.sh     先起 php-fpm,再 `exec nginx -g 'daemon off;'`
 env/gen_profiles.py     14 个 profile 的唯一来源 -> env/generated/<name>/
@@ -121,6 +146,8 @@ exploits/               PoC(自包含,不含任何宿主机绝对路径)
   fpm_rce.py            nginx + PHP-FPM 链(悬空 BG(unserialize) → 任意文件写入)
   fpm128_rce.py         同一条链打 PHP 出厂默认 memory_limit=128M(空文件名分片加压);
                         WORKERS=n 时按池大小逐个 arm,同时覆盖多 worker 目标
+  pma512_rce.py         第三条链:上游 phpMyAdmin 5.2.3-fpm 镜像、出厂 512M,
+                        先造 100 MB session 文件再让脚本级 session_start() 撞限制
 measure/                标定与 gdb 辅助脚本(普通复现不需要)
   利用驱动              measure_dd_any.py、mw_full_test.py、measure_s3_formfill.py、
                         measure_loaded_worker.py、dev_r0.py(重测 R0)
@@ -144,6 +171,14 @@ php-fpm(容器内 `127.0.0.1:9000`),`docker/<profile>/www` 挂到 `/srv/www`(链
 的 14 个 mod_php profile,用自己的 `fpm-up`/`fpm-down`(可带 profile 名),`status` 会给
 活着的那个各多打一行。
 
+phpMyAdmin 链是两个容器:`p2s-pma` 就是官方 `phpmyadmin/phpmyadmin:5.2.3-fpm`,站点、
+`php.ini`、`[www]` 池、`/sessions` 全是镜像自带的,我们没有挂载任何配置进去;
+`p2s-pma-web` 是同一网络栈里的 nginx sidecar(`--network container:p2s-pma`),只读挂
+`docker/pma/nginx.conf`,把宿主 `PMA_PORT`(默认 8115)转给容器内的 `127.0.0.1:9000`。
+它也不参与 `up`/`down`/`status`,用自己的 `pma-up`/`pma-down`。唯一的启动参数改动是
+`rm -f /usr/local/etc/php/conf.d/docker-php-ext-uploadprogress.ini` —— 见
+「[受害者条件](#受害者条件)」里那条镜像特有的坑。
+
 ## profile 与对应 PoC
 
 | 别名 | 容器 | 端口 | memory_limit | display_errors | expose_php | save_path | worker | opcache | PoC |
@@ -165,15 +200,19 @@ php-fpm(容器内 `127.0.0.1:9000`),`docker/<profile>/www` 挂到 `/srv/www`(链
 | `fpm` | p2s-fpm | 8112 | 8M | Off | On | /var/lib/php/sessions | 1(static) | – | `exploits/fpm_rce.py` |
 | `fpm128` | p2s-fpm128 | 8113 | 128M | Off | On | /var/lib/php/sessions | 1(static) | – | `exploits/fpm128_rce.py` |
 | `fpm4` | p2s-fpm4 | 8114 | 128M | Off | On | /var/lib/php/sessions | 4(static) | – | `exploits/fpm128_rce.py` + `WORKERS=4` |
+| `pma` | p2s-pma + p2s-pma-web | 8115 | 512M | On | On | /sessions | 2(dynamic,上限 5) | On | `exploits/pma512_rce.py` |
 
-前 14 行是 mod_php 链;最后三行是 nginx + PHP-FPM 链,`sapi=fpm`,同一条链的两种
-`memory_limit` 与两种池大小,由 `fpm-build`/`fpm-up` 单独管理。
+前 14 行是 mod_php 链;`fpm`/`fpm128`/`fpm4` 是 nginx + PHP-FPM 链,`sapi=fpm`,同一条
+链的两种 `memory_limit` 与两种池大小,由 `fpm-build`/`fpm-up` 单独管理;`pma` 是第三条
+链 —— PHP 版本是 8.3.26,受害者是别人的镜像与站点,由 `pma-up` 单独管理,ini 那三列
+全是镜像的出厂状态(它没有 `php.ini`,所以这些就是 PHP 的编译默认值加上
+`phpmyadmin-misc.ini`)。
 
 所有 mod_php profile 提供同一个 22 字节页面。`exploit <别名>` 会替你选好 PoC、堆标定
 (`PROFILE`)和 proof 路径;`-s <脚本>` 覆盖脚本,`-c` 覆盖命令,结尾的数字设置
 `mw` 的扇出宽度(默认取该 profile 的 `MaxRequestWorkers`)。`exploit fpm`/`fpm128`/`fpm4`
-同样接受 `-c`,proof 分别落在 `out-fpm/pfpm`、`out-fpm128/pfpm128`、`out-fpm4/pfpm4`;
-`fpm4` 这一行还替 PoC 设好 `WORKERS=4`。
+同样接受 `-c`,proof 分别落在 `out-fpm/pfpm`、`out-fpm128/pfpm128`、`out-fpm4/pfpm4`、
+`out-pma/ppma`;`fpm4` 这一行还替 PoC 设好 `WORKERS=4`。
 
 本树 2026-10-23 的验证结果:`p2s.py verify` 14 个 mod_php 容器全绿,一次连续
 `exploit` 扫描对每个 profile 都拿到
@@ -189,6 +228,12 @@ FPM 链:`php-fpm` 二进制由 `fpm-build` 现场编译(链上只有 libc/libm),
 `exploit fpm4` 也一样第一次就打通(4 个 static 子进程,单个 arming 轮覆盖 R2a/R2b/R3
 三个阶段),`fpm-down fpm4` + `fpm-up fpm4` 重建后重跑再次拿到 `uid=33(www-data)`,
 单次约 43 秒(2026-10-24 实测)。
+phpMyAdmin 链:`phpmyadmin/phpmyadmin:5.2.3-fpm` 原样跑起来(镜像与 ini 都不改,只删
+`docker-php-ext-uploadprogress.ini`),`exploit pma` 五次独立运行(含 `pma-down` +
+`pma-up` 重建两个容器之后)都拿到 `uid=33(www-data)`。
+每次 A 的客户端计算长度都与 `stat` 逐字节一致(`match=True`),`prime -> 200`、
+第 2 次 stage 尝试 `-> 502` 并写出 shell、`GET /tmp/x.php?0=id` 回显;单次约 154 秒,
+其中 R0 灌 208 条记录约 147 秒(2026-10-24/25 实测)。`verify pma` 全绿。
 
 ## 相比参考链我们解决了哪些痛点
 
@@ -214,6 +259,10 @@ prefork,以 A1 → B1 → A2 → B2 四步完成利用,目标页面只有 `<?php
 | 只有 mod_php 一个 SAPI | 第二条链走 PHP-FPM:SAPI 路径完全不同,利用 pre-RINIT 的悬空 `BG(unserialize)` 解码器改写 session 落盘目标,让 worker 自己把 PHP 代码写进站点根目录 —— 不需要代码指针,也不需要 `libphp` 泄漏 | `fpm`、`fpm128`、下文「利用链(二)」 |
 | FPM 链需要把 `memory_limit` 调小才填得满 | 压力从深嵌套字段换成 `filename=""` 的 RFC1867 分片:约 300 字节请求体吃约 128 KB 堆,920 个分片填满足以打死 128 MB 的 worker,PHP 出厂默认限制即可利用;顺带每个请求都落在 nginx 默认 `client_max_body_size 1m` 之内,前置不需要调 | `fpm128`、下文「128M 变体」 |
 | FPM 链的陈旧解码器是**每进程**状态,只能钉 `pm = static` + 1 个子进程 | nginx 每个请求新开一条上游连接,FPM 按严格轮询把连接发给空闲子进程,于是先用 N 个 prime 把 N 个子进程逐个 arm,再连续发三个阶段;R2a/R2b 各自打死所在子进程,所以一轮 arm 覆盖 `min(3, N)` 个阶段 | `fpm4`(4 个 static 子进程,一轮打完 R2a/R2b/R3)、下文「多 worker 变体」 |
+| 受害者是我们自己写的 22 字节 / 39 字节页面,限制是我们自己的 `php.ini` | 第三条链打在**别人维护的产品镜像**上:原封不动的 `phpmyadmin/phpmyadmin:5.2.3-fpm`(PHP 8.3.26),攻击面是它真实的 `/index.php`,`memory_limit` / `post_max_size` / `max_input_vars` / `use_strict_mode` / 池配置全是出厂值,ini 一条不改 | `pma`、下文「利用链(三)」 |
+| 128M 版靠单个请求的 920 个分片吃满堆,前提是前置给足 body | 出厂 `2048K` 拦住了一次请求,于是压力搬到**跨请求累积的 session 文件**:逐条喂到 100,566,855 字节的 208 条 upload-progress 记录,由 phpMyAdmin 自己脚本级的 `session_start()` 在反序列化时撞穿 512M —— 每个请求仍然在 2 MB 之内 | `pma` 的 R0/R3 |
+| 落盘路径由 PoC 自己指定,写出去的内容也是 PoC 构造的 | 路径从**目标自己的 session 内容**里伪造:借 phpMyAdmin 登录流程存下的 880 KB `guid` 当载体,在已知偏移造出 `zend_string`(长度 + 字节),让 `ps_files->basedir` 指向 phpMyAdmin 自己那个出厂 `drwxrwxrwt` 的 `tmp/` | `pma` 的 R1/R4 |
+| 池大小固定 ⇒ `WORKERS` 能钉住 | `pm = dynamic` 下存活子进程数不可控,而陈旧解码器仍是每进程状态:链为每个 stage 尝试预先伪造一份 session,同一个阶段体按 sid 各发一次,轮到 arm 过的那个子进程写出 shell,其余只是正常保存自己的 session | `pma`(`ATTEMPTS=6`)|
 
 ## 利用链(一)—— mod_php
 
@@ -356,6 +405,73 @@ shaping 请求(1、2)把 worker 打死是设计的一部分:FPM 立刻 fork 替�
   (`R2a -> 502`,arm 中的子进程果然被打死)。状态码跟着 flush 时机变,与下面「状态码」
   那条坑一致,判定成功仍然看写出来的 shell 有没有回显。
 
+## 利用链(三)—— 上游 phpMyAdmin 5.2.3-fpm(出厂 512M)
+
+`exploits/pma512_rce.py`。受害者是原样跑起来的官方
+`phpmyadmin/phpmyadmin:5.2.3-fpm`(PHP 8.3.26):站点是真正的 phpMyAdmin,攻击面是它的
+`/index.php`,`memory_limit=512M`、`post_max_size=upload_max_filesize=2048K`、
+`max_input_vars=10000`、`session.use_strict_mode=On`、`[www]` 池
+(`pm = dynamic`,`start_servers = 2`,`max_children = 5`)全部是镜像出厂状态,
+一条都不调。前置 nginx 的 `client_max_body_size 2m` 也正是镜像 `UPLOAD_LIMIT=2048K`
+要求的额度。落点 `/var/www/html/tmp` 是 phpMyAdmin 自己维护、出厂就是 `drwxrwxrwt`
+的临时目录;能不能被执行取决于前置 —— 我们的 sidecar 与标定环境一样,用一条
+`location ~ \.php$` 服务整个站点根目录,这条路径因此可达。它是前置的属性,不是镜像
+的属性,所以算这条链的条件之一(见下文「受害者条件」)。
+机制与前一条链相同(pre-RINIT 的 upload-progress 解码留下悬空的 `BG(unserialize)`),
+这里只写三个新的地方。
+
+**压力来源换成 session 文件本身。** 2 MB 的 body 上限拦住了一次请求吃满 512M,
+所以堆压力不再来自单个请求,而来自一个逐条喂到 **100,566,855 字节**的 session 文件
+(R0)。每条记录都是一个正常的 upload-progress 请求:带
+`PHP_SESSION_UPLOAD_PROGRESS=<key>` 与一个文件分片,在分片的 `FILE_START` 处 session
+被解码并落盘(记录因此持久化),紧接着补一墙 `filename=""` 的嵌套分片
+(`x<k>[a][a]…`,`LEVELS=60`)让 body 解析器 OOM —— `cleanup` 于是没机会跑,记录留下,
+worker 被 respawn。墙的大小按「`512M − 2 × 已跟踪的文件长度`」客户端算出,记录长度由
+`upload_progress_<key>|a:5:{…}` 的序列化布局加请求体长度决定,读位置由 5 KiB 多部分
+缓冲的算术模拟,所以最终字节数不需要向服务器要任何反馈(每次运行用 `stat` 校验,
+`match=True`)。共 208 条:1 条种子 + 73 条短文件名(316 B)+ 134 条 750 KB 文件名,
+最后一条的文件名长度被解到恰好凑满总数。种子请求故意用一个不存在的 id
+(`PHPSESSID=seed0`):`use_strict_mode` 会丢掉它并另发一个 id,于是 A 里只有
+upload-progress 记录、没有 phpMyAdmin 自己的字段,长度计算和后面的堆布局才可比。
+
+**arm 打在别人的 `session_start()` 上(R3)。** phpMyAdmin 在脚本里
+`libraries/classes/Session.php` 调 `session_start()`,不是 pre-RINIT,所以先用 8150 个
+嵌套字段名(2,003,799 字节,贴着 2048K 的限制)填住堆,再让脚本级的 decode 去读那个
+100 MB 文件:实测 `alloc_wall ≈ 423,624,704 B` + `A decode ≈ 243,175,424 B` 撞穿
+536,870,912,`php_var_unserialize()` 内部 fatal,`php_execute_script()` 的
+`zend_first_try` 接住它 —— worker 活着,`BG(unserialize)` 停在 level 1 指向已释放的
+`php_unserialize_data`。**prime 回 200 才算 arm 成功**(它不能死)。arm 的前提是
+opcache 冷:所以 R2 先 `kill -USR2 1` 重载池,让 prime 是新子进程处理的第一个 phpMyAdmin
+请求。
+
+**session 内容就是载体,落点靠伪造 `zend_string`(R1 + R4)。** 阶段用的 session 不是
+我们写的文件,而是走 phpMyAdmin 自己的登录流程生成的:GET 拿 CSRF token,再 POST 登录
+并带一个 **880,000 字节的 `guid`**;phpMyAdmin 把它当 `$_SESSION` 的键存下,于是文件
+变成一份我们知道每个偏移的内容。guid 从文件偏移 125 开始,里面按偏移覆写四处:
+`DT_OFF=528360` 处 8 字节 0(`var_dtor_entries.used_slots = 0`)、`+0x50` 处 24
+(伪 `zend_string` 的 `len`,= `len("/var/www/html/tmp/x.php")+1`)、`+0x58` 处路径本身
+带结尾 NUL、`E_OFF=856040` 处 `AIM_U=-108596`(`var_entries.used_slots`)。
+阶段请求体 1,060,409 字节:`4172` 个嵌套字段名把 chunk K 塑形成标定页,`300` 个 15 字节
+值(`zend_string_alloc(15)` = 40 B → 分配器 bin 4)预热,`6` 个重名字段释放 6 个 bin-4
+槽位给 progress 数组自己的键字符串,最后 `PHP_SESSION_UPLOAD_PROGRESS=<?php system($_GET[0]); ?>`
+加一个文件分片触发 pre-RINIT 解码。这一次解码读的是那份 880 KB 的 session:`s_read`
+把它整块分配在 `K+0x86018`(第 134 页),覆盖 `DT`(p263)与 `E`(p343)上的伪造字节,
+而 `D_A`(p435)留在外面;陈旧数组的 `used_slots` 被 guid 覆写后,5 次 push 正好落在
+`ps_files`(实测 `K+0x82e88`)的 `−24/−16/−8/+0/+8` 上,`basedir` 拿到 `DT+0x40` 那个
+伪 `zend_string`。随后 `php_session_flush()` 走 `ps_files_open()` 的重开路径,按伪造的
+basedir 拼路径,`open()` 在嵌入的 NUL 处截断,session 文本(含 payload 记录)被
+`pwrite` 到 `/var/www/html/tmp/x.php`(880,503 字节)。命中的那次 stage 回 **502**
+(写完之后 worker 才死),其余回 200 —— 未 arm 的进程只是正常保存自己的 session。
+
+**池不固定,所以一个尝试一份 session(R4)。** `BG(unserialize)` 是每进程状态,而
+`pm = dynamic` 的存活子进程数不可控、phpMyAdmin 又自己掌握 id 轮换,所以链预先伪造
+`ATTEMPTS=6` 份 session,把同一个阶段体按 sid 各发一次;轮到 arm 过的那个子进程的那一次
+写出 shell,其余是无害的。`GET /tmp/x.php?0=id` 拿回 `uid=33(www-data)`。
+
+实测 5/5:全新容器、`pma-down`/`pma-up` 重建之后都拿到
+`PROOF: uid=33(www-data)`;A 的客户端尺寸每次都与 `stat` 一致。端到端约 **154 秒**,
+其中 R0 约 147 秒(208 条记录,每条都要等 FPM 给出活的子进程)。
+
 ## 常量
 
 | 项目 | 值 |
@@ -401,6 +517,30 @@ shaping 请求(1、2)把 worker 打死是设计的一部分:FPM 立刻 fork 替�
 | `WORKERS` | 1(`fpm128`)/ 4(`fpm4`) | 需要 arm 的存活子进程数;`fpm4` 用 `docker/fpm4/php-fpm.conf` 的 `pm = static` + `pm.max_children = 4` |
 | `ATTEMPTS` | 单 worker 1、池 3 | 整条链的重试次数,每次换一组 session id(阶段打空时记录会被清掉) |
 | `SETTLE` | 0.5 s | 每轮 arm 前等子进程补满的间隔 |
+
+### 常量(phpMyAdmin 5.2.3-fpm,512M)
+
+| 项目 | 值 | 说明 |
+| --- | --- | --- |
+| `TARGET` | `100,566,855` B | session 文件 A 的长度,由 208 条 upload-progress 记录凑出(1 条种子 + `NSMALL=73` 条 316 B + 134 条 750 KB 文件名,最后一条文件名长度解出来恰好补满)|
+| `PRIME_N` | `8150` | 嵌套字段名个数,prime 体 2,003,799 B(出厂 `post_max_size=2048K` 之内)|
+| 撞穿限制的分配 | wall `423,624,704` + decode `243,175,424` B | 报告文本 `tried to allocate 753664 bytes`,出自 `libraries/classes/Session.php` |
+| `NFF` / `NPW` / `NDUP` | `4172` / `300` / `6` | 阶段体 1,060,409 B:塑形嵌套字段 / bin-4 预热 / 释放 6 个 bin-4 槽 |
+| `GLEN` / guid 起点 | `880,000` / 文件偏移 `125` | 伪造载体就是 phpMyAdmin 登录时存下的 `browser_access_time` 键 |
+| `DT_OFF` / `E_OFF` | `528360` / `856040` | = `DT − buffer`、`E − buffer`,即 guid 内相对起点的偏移 |
+| `AIM_U` | `-108596` | `(ps_files − E − 40) / 8`,让第 5 次 push 落在 `basedir` |
+| `ps_files` | `chunk + 0x82e88` | 本容器的实测值;参考发布的是 `+0x82cd0`,差 `0x1b8` = 440 B = 55 个槽 |
+| `s_read` 缓冲 | `chunk + 0x86018`(第 134 页)| 覆盖 `DT`(p263)与 `E`(p343),`D_A`(p435)留在外面 |
+| 伪 `zend_string` | `DT + 0x40`,`len` 在 `DT_OFF+0x50` = 24,字节在 `+0x58` | `len` 含结尾 NUL,`open()` 在 NUL 截断 |
+| 落盘 | `/var/www/html/tmp/x.php`,880,503 B | 目录出厂 `drwxrwxrwt`;能否执行取决于前置是否把 `tmp/` 交给 PHP(本实验的 sidecar 会) |
+| ini / 池 | 全部出厂:`512M`、`2048K`、`max_input_vars=10000`、`use_strict_mode=On`、`pm = dynamic` / `start_servers = 2` / `max_children = 5` | 唯一的启动改动是卸载 `uploadprogress` 扩展,见「受害者条件」 |
+| `ATTEMPTS` / `SETTLE` | `6` / `0.35 s` | 一次 stage 尝试一份伪造 session;每条 A 记录之后等 FPM 给出活的子进程 |
+
+与自建 FPM 目标一样,这些数一个都不需要泄漏:chunk 内布局在 `fork()` 之后逐字节相同,
+容器重启换 ASLR 不影响(实测过)。全部可用同名环境变量覆盖(`TARGET`、`PRIME_N`、
+`NFF`/`NPW`/`NDUP`、`GLEN`、`DT_OFF`/`E_OFF`/`AIM_U`、`NSMALL`/`FNLEN`/`PER_PART`/
+`BODY_MAX`、`ATTEMPTS`/`SETTLE`、`LIMIT`),换镜像版本或换 ini 之后按下文「踩过的坑」
+里的 gdb 孪生容器重测 `ps_files` 即可。
 
 PoC 需要从目标拿到的只有每次运行泄漏出的 `chunk` 与 `libphp` 基址,所以 ASLR 和容器
 重启都不影响。*不可*移植的是请求形态:`R0`、填充数量、`CMDOFF` 是这个构建、这份
@@ -455,6 +595,27 @@ body 很小、约 1–2 MB,但会吃掉整个 `memory_limit` 的堆;`display_err
 `client_max_body_size`(8M 版要把它抬到 8m,128M 版不用)之类会改变 shaping 请求的数量
 与形状。
 
+**phpMyAdmin 链**的硬性条件与前一条 FPM 链相同(pre-RINIT 解析、`upload_progress`
+On + cleanup On、`files` handler、有个 web 可达且可写的目录),再加两条这个镜像特有的:
+
+* **PECL `uploadprogress` 扩展必须不加载**。镜像默认装了它,而它会盖掉 PHP 自己的
+  `php_rfc1867_callback`、从不把 session 模块的 handler 串进去,于是
+  `session.upload_progress` 在上传期间根本不会初始化或落盘 session —— 第一条记录就消失。
+  `p2s.py pma-up` 在容器启动命令里 `rm -f
+  /usr/local/etc/php/conf.d/docker-php-ext-uploadprogress.ini`,这是整条链唯一一处对镜像
+  启动方式的改动(`verify pma` 会报 `upext=unloaded`)。
+* **`tmp/`(或任一被当 PHP 服务的可写目录)要 web 可达**。目录本身不用改:phpMyAdmin
+  出厂就把 `/var/www/html/tmp` 留成 `drwxrwxrwt`;可达与否取决于前置 —— 我们的
+  sidecar 与标定环境一样,用一条 `location ~ \.php$` 把整个站点根目录交给 PHP,
+  这个路径因此可达。这是**前置**的属性而不是镜像的属性,所以按这条链的条件看:
+  真实部署里凡是不解析 `tmp/` 的前置都写不响,得换可写的其它入口(见 FPM 链同一条)。
+* 部署侧还有与自建目标一样的前提:prime 之前 opcache 必须是冷的(本实验用
+  `kill -USR2 1` 重载池,真实环境里等价于目标刚重启或池刚 reload);前置的 body 上限
+  不能低于镜像自己要求的 `UPLOAD_LIMIT=2048K`。
+* 已经不再是条件:任何 ini 调低(512M / 2048K / 10000 / `use_strict_mode=On` 全是出厂值)、
+  我们自己写的受害者页面、`pm = static` 的固定池、`display_errors` / `expose_php`
+  (这两项在这个镜像里是编译默认 `On`)、代码指针与基址泄漏、ASLR。
+
 ## 回收
 
 * `p2s.py prune [profile…]` 删除每个容器内的 `/tmp/sess_*` 与 `/srv/out/*`,以及宿主
@@ -474,6 +635,13 @@ body 很小、约 1–2 MB,但会吃掉整个 `memory_limit` 的堆;`display_err
   `out-fpm4/` 一起清;`fpm-down [profile…]` 删容器,`docker rmi p2s-php844-fpm` 删镜像。
   prime 请求打死 worker 同样是预期行为,FPM 立刻 respawn,而 chunk 内布局与陈旧全局
   照旧。
+* phpMyAdmin 链:`p2s.py prune pma` 删容器里的 `/sessions/sess_*`(A 那一份就有 100 MB)
+  和链写出的 `/var/www/html/tmp/x.php`,以及宿主侧 `out-pma/`;`pma-down` 删
+  `p2s-pma` / `p2s-pma-web` 这两个容器,`docker rmi phpmyadmin/phpmyadmin:5.2.3-fpm`
+  删镜像(约 400 MB)。`exploit pma` 前后也会做同样的清理 —— 残留的 A 会让下一次
+  prime 提前 OOM,残留的 `x.php` 会让失败看起来像成功。record 与 prime 打死 worker
+  同样是预期行为:`[www]` 池立刻 respawn,`docker exec p2s-pma sh -c "kill -USR2 1"`
+  只是把堆恢复到标定时的冷 opcache 状态。
 
 ## 重建受害者二进制
 
@@ -562,6 +730,15 @@ libc/libm)上整条链**第一次就打通**,块偏移与标定值一致 —— 
 configure 行编译、md5 不同的 `php-fpm` 上量出来的,拿到 `fpm-build` 的产物上第一次运行
 同样打通:块位置跟着 configure 行和 ini 走,不跟着构建目录走。
 
+### phpMyAdmin 受害者
+
+第三条链**不编译任何东西**:`pma-up` 直接 `docker run` 官方的
+`phpmyadmin/phpmyadmin:5.2.3-fpm`,PHP 8.3.26、phpMyAdmin 5.2.3、ini、池、站点全是镜像
+自带的。也因此没有「重建后标定能不能活」这个问题 —— 标定跟着镜像 tag 走;换 tag
+(或换 `MEMORY_LIMIT`/`UPLOAD_LIMIT` 环境变量)就要重测 `ps_files`,见「踩过的坑」里
+那条 gdb 孪生容器的做法。`p2s.py pma-up` 唯一加的启动参数是删掉
+`docker-php-ext-uploadprogress.ini`。
+
 ## 踩过的坑
 
 * `docker/www/index.php` 必须与校准时的页面字节一致
@@ -605,6 +782,37 @@ configure 行编译、md5 不同的 `php-fpm` 上量出来的,拿到 `fpm-build`
   `shell.php` 会留在宿主目录里,靠 `prune fpm fpm128 fpm4` / `exploit fpm*` 的前后清理回收。
 * Git Bash 里 `SHELL` 已有环境含义,别拿它当 PoC 的变量名 —— FPM 的落盘路径用
   `FPM_SHELL`。
+* phpMyAdmin 镜像默认带 PECL `uploadprogress`,它会顶掉 `php_rfc1867_callback` 并且不
+  往下串 session 模块的 handler:表现是第一棵 A 记录都留不下来,而 HTTP 层一切正常
+  (200、有 `Set-Cookie`)。这条链的**全部**压力来源都在 upload-progress 落盘上,所以
+  `pma_create()` 第一件事就是删掉那个 ini;`verify pma` 的 `upext=unloaded` 就是查这个。
+* 判定 arm 成功**不能**看「A 文件还在」:prime 走完 phpMyAdmin 的脚本逻辑之后会把自己
+  那份 session 覆盖到同一个文件上。可用的信号是 prime 回 **200**(它必须活着)、worker
+  没被打死,以及响应体里那句 `Allowed memory size of 536870912 bytes exhausted
+  (tried to allocate 753664 bytes) in …/libraries/classes/Session.php` —— 它落在
+  `session_start()` 里面才算 arm 到位(该镜像 `display_errors` 是编译默认 `On`,所以
+  这句话能直接读到)。反过来,命中的 stage 回 **502**:文件写完之后 worker 才死。
+  `memory_get_peak_usage` 是进程累计值,不能当单次请求的判据。
+* `AIM_U` 是这个镜像里唯一**不跟着发布值走**的常量:`ps_files` 落在 `chunk + 0x82e88`
+  而不是参考运行的 `+0x82cd0`,差 `0x1b8` = 440 B = 55 个槽,所以 `AIM_U` 必须是
+  `-108596` 而不是 `-108651`(公式 `AIM_U = (ps_files − E − 40) / 8`)。症状很好认:
+  stage 全部回 200、页面正常,session 只是按正常路径存回自己文件里。重测办法是起一个
+  **孪生**容器(`--cap-add=SYS_PTRACE`,apt 走 USTC 源装 gdb 16.3),在
+  `php_var_unserialize_init` 上下断(只有 `level==1` 时才会停,天然只命中 stage 那次
+  解码),从 `.dynsym` 读 `basic_globals`(`bg = &basic_globals + 0x358`,`level` 在
+  `bg+8`)与 `ps_globals`(`mod = u64(ps_globals + 0x60)`),再按 session 文本里的
+  `browser_access_time|a:1:{s:880000:"` 找到 `s_read` 缓冲起点,就能一次算出
+  `DT_OFF`/`E_OFF`/`AIM_U`。**不要**把断点挂在真实的 exploit 容器上,也不要对参考那边
+  的 `pma_lab`/`pma_nginx` 做任何这类操作。
+* prime 的 2,003,799 字节贴着出厂 `post_max_size=2048K`(2,097,152),前置的
+  `client_max_body_size 2m` 又刚好是镜像 `UPLOAD_LIMIT=2048K` 要求的额度:加大 `PRIME_N`
+  或 A-big 的 `FNLEN` 会静默变成 413,而不是「堆填得更多」。
+* 这个目标上 session id 有**两个名字**:pre-RINIT 的解码看 ini 默认的 `PHPSESSID`,
+  phpMyAdmin 在脚本里 `session_name("phpMyAdmin")`,而哪个生效取决于这个子进程服务的
+  是不是它第一个请求,HTTP 侧无法控制。所以凡是要求解析器看到的请求都同时带两个同名
+  同值的 cookie。
+* `docker logs --since` 的时间戳必须是 UTC 且带 `Z`,否则 FPM 的
+  `exit ... (signal 6)` 行会被过滤掉,看起来像「worker 没死」。
 
 ## 整理时从原目录删掉的内容
 
@@ -617,13 +825,14 @@ configure 行编译、md5 不同的 `php-fpm` 上量出来的,拿到 `fpm-build`
 `fcgi.py`、`bg_fpm.py` 和整套 `gdb-bg*.py` 探针 —— 它们的结论以常量形式写进了
 `exploits/fpm_rce.py`,容器化的 HTTP 环境重写成了 `docker/Dockerfile.fpm` +
 `docker/fpm/`),以及所有 `out-*` 运行产物。
-保留:六个 PoC(mod_php 四个 + nginx/PHP-FPM 两个,后者按 `WORKERS` 覆盖单 worker 与
-4 worker 池两种目标)加原样保留的参考实现
+保留:七个 PoC(mod_php 四个 + nginx/PHP-FPM 两个,后者按 `WORKERS` 覆盖单 worker 与
+4 worker 池两种目标;再加打上游 phpMyAdmin 镜像的一个)加原样保留的参考实现
 `exploit.py`、记录了每个常量*如何*测得的 gdb 驱动脚本,以及这些驱动加载的四个
 `gdb-*.py`。
 
-两条链都在本仓库里、各自一条命令跑通:mod_php 见「利用链(一)」(`exploit off` 等),
-nginx + PHP-FPM 见「利用链(二)」(`exploit fpm` / `exploit fpm128` / `exploit fpm4`)。
+三条链都在本仓库里、各自一条命令跑通:mod_php 见「利用链(一)」(`exploit off` 等),
+nginx + PHP-FPM 见「利用链(二)」(`exploit fpm` / `exploit fpm128` / `exploit fpm4`),
+上游产品镜像见「利用链(三)」(`exploit pma`)。
 
 ## 致谢
 
@@ -640,7 +849,11 @@ nginx + PHP-FPM 见「利用链(二)」(`exploit fpm` / `exploit fpm128` / `expl
   pre-RINIT session 解码会留下悬空的 `BG(unserialize)` 解码器。把它做成纯 HTTP、可
   一键复现的 nginx + PHP-FPM 利用(三步逼近的 push 标定、任意文件写入的落点选择、
   用空文件名分片把压力放大到能吃满出厂默认 128M、按轮询把整池 worker 逐个 arm、
-  容器与重建流程)是本树完成的。
+  容器与重建流程)是本树完成的;把它收成第三个形态 —— 原封不动的上游产品镜像
+  `phpmyadmin/phpmyadmin:5.2.3-fpm`(出厂 512M/2048K/`use_strict_mode=On`/dynamic 池,
+  跨请求累积的 100 MB session 文件、用目标自己的 880 KB session 内容伪造落点路径)——
+  沿用同一方向的标定成果,本树做的是把它收进一键实验、做成单文件 PoC,并在我们自己的
+  孪生容器上重测出这个镜像实际用到的 `ps_files`/`AIM_U`。
 * PHP 漏洞本身(session bailout 背后的 UAF)属于上游;本实验是对其可利用性的研究,
   全部只针对本实验自己创建的容器。
 
